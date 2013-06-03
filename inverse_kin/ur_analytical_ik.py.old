@@ -1,0 +1,301 @@
+import numpy as np
+import copy
+from numpy import sqrt, sin, cos, arctan2, arccos, arcsin, abs, pi
+import roslib
+roslib.load_manifest('ur_cart_move')
+roslib.load_manifest('hrl_geom')
+import rospy
+from hrl_geom.pose_converter import PoseConv
+from geometry_msgs.msg import PoseStamped
+from ur_cart_move.ur_cart_move import RAVEKinematics
+from hrl_geom.transformations import rotation_from_matrix as mat_to_ang_axis_point
+
+d1, d2, d3 = 0., 0., 0.
+a1, a2, a3 = 1., 0.5, 0.3
+
+h_1 = 0.1273
+h_3 = 0.0922
+p_1 = 0.0
+p_3 = 0.1157
+
+def inverse_rrr(T04, a=[a1, a2, a3], d=[d1, d2, d3]):
+    a1, a2, a3 = a
+    d1, d2, d3 = d
+    p04x, p04y = T04[0,3], T04[1,3]
+    x04x = T04[0,0]
+    x04y = T04[1,0]
+    qs1 = []
+    p13x = p04x - a3*x04x
+    p13y = p04y - a3*x04y
+    c2 = (p13x**2 + p13y**2 - a1**2 - a2**2) / (2.*a1*a2)
+    for ssign in [1., -1.]:
+        q = [0.]*3
+        s2 = ssign*np.sqrt(1. - c2**2)
+        q[1] = np.arctan2(s2, c2)
+        denom = a1**2 + a2**2 + 2*a1*a2*c2
+        c1 = ((a1 + a2*c2) * p13x + a2*s2*p13y) / denom
+        s1 = ((a1 + a2*c2) * p13y - a2*s2*p13x) / denom
+        q[0] = np.arctan2(s1, c1)
+        c12 = np.cos(q[0]+q[1])
+        s12 = np.sin(q[0]+q[1])
+        c3 = x04x*c12 + x04y*s12
+        s3 = c12*x04y - s12*x04x
+        q[2] = np.arctan2(s3, c3)
+        qs1.append(q)
+    qs2 = []
+    for q in qs1:
+        qs2.append(q)
+        if q[0] > 0:
+            qs2.append([q[0]-2.*pi, q[1], q[2]])
+        else:
+            qs2.append([q[0]+2.*pi, q[1], q[2]])
+    qs3 = []
+    for q in qs2:
+        qs3.append(q)
+        if q[1] > 0:
+            qs3.append([q[0], q[1]-2.*pi, q[2]])
+        else:
+            qs3.append([q[0], q[1]+2.*pi, q[2]])
+    qs4 = []
+    for q in qs3:
+        qs4.append(q)
+        if q[2] > 0:
+            qs4.append([q[0], q[1], q[2]-2.*pi])
+        else:
+            qs4.append([q[0], q[1], q[2]+2.*pi])
+    return qs4
+
+def forward_rrr(q):
+    T01 = np.mat([[np.cos(q[0]), -np.sin(q[0]), 0., 0.],
+                  [np.sin(q[0]), np.cos(q[0]), 0., 0.],
+                  [0., 0., 1., d1],
+                  [0., 0., 0., 1.]])
+    T12 = np.mat([[np.cos(q[1]), -np.sin(q[1]), 0., a1],
+                  [np.sin(q[1]), np.cos(q[1]), 0., 0.],
+                  [0., 0., 1., d2],
+                  [0., 0., 0., 1.]])
+    T23 = np.mat([[np.cos(q[2]), -np.sin(q[2]), 0., a2],
+                  [np.sin(q[2]), np.cos(q[2]), 0., 0.],
+                  [0., 0., 1., d3],
+                  [0., 0., 0., 1.]])
+    T34 = np.mat([[1., 0., 0., a3],
+                  [0., 1., 0., 0.],
+                  [0., 0., 1., 0.],
+                  [0., 0., 0., 1.]])
+    return T01*T12*T23*T34
+
+def inv_mat(T):
+    R = np.mat(np.eye(4))
+    R[:3,:3] = T[:3,:3].T
+    R[:3,3] = -T[:3,:3].T * T[:3,3]
+    return R
+
+Tb0 = np.mat([[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+T6e = np.mat([[0, -1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0], [0, 0, 0, 1]])
+
+def forward_kin(q, a, d, l):
+    Ts = []
+    Tlast = Tb0
+    for qi, ai, di, li in zip(q, a, d, l):
+        cqi, sqi = cos(qi), sin(qi)
+        cli, sli = cos(li), sin(li)
+        T = np.mat([[cqi, -sqi*cli,  sqi*sli, ai*cqi],
+                    [sqi,  cqi*cli, -cqi*sli, ai*sqi],
+                    [      0,          sli,          cli,         di],
+                    [      0,                0,                0,          1]])
+        Tlast = Tlast*T
+        Ts.append(T)
+    Tlast *= T6e
+    return Tlast, Ts
+
+ZERO_THRESH = 0.00001
+
+def inverse_kin(T06, a, d, l):
+    qs1 = []
+    T = inv_mat(Tb0) * T06 * inv_mat(T6e)
+    A = d[5]*T[1,2] - T[1,3]
+    B = d[5]*T[0,2] - T[0,3]
+    R = A*A + B*B
+    if abs(A) < ZERO_THRESH:
+        print '1: A low'
+        return None
+    elif abs(B) < ZERO_THRESH:
+        print '1: B low'
+        return None
+    elif d[3]*d[3] > R:
+        print '1: Impossible solution'
+        return None
+    else:
+        for i in range(4):
+            qs1.append([0.]*6)
+        acos = arccos(d[3] / sqrt(R)) 
+        atan = arctan2(B, A)
+        pos = acos - atan
+        neg = -acos - atan
+        qs1[0][0] = pos
+        qs1[1][0] = neg
+        if pos < 0:
+            qs1[2][0] = pos + 2.*pi
+        else:
+            qs1[2][0] = pos - 2.*pi
+        if neg < 0:
+            qs1[3][0] = neg + 2.*pi
+        else:
+            qs1[3][0] = neg - 2.*pi
+    qs2 = []
+    for i in range(len(qs1)):
+        for j in range(4):
+            qs2.append(copy.copy(qs1[i]))
+        acos = arccos(T[0,2]*sin(qs1[i][0]) - T[1,2]*cos(qs1[i][0]))
+        qs2[i*4+0][4] = acos
+        qs2[i*4+1][4] = -acos
+        qs2[i*4+2][4] = 2.*pi - acos
+        qs2[i*4+3][4] = -2.*pi + acos
+
+    qs3 = []
+    for i in range(len(qs2)):
+        for j in range(4):
+            qs3.append(copy.copy(qs2[i]))
+        s4 = sin(qs2[i][4])
+        if abs(s4) < abs(T[0,0]*sin(qs2[i][0]) - T[1,0]*cos(qs2[i][0])):
+            print '6: s4 low'
+            return None
+        acos = arccos((T[0,0]*sin(qs2[i][0]) - T[1,0]*cos(qs2[i][0])) / s4)
+        qs3[i*4+0][5] = acos
+        qs3[i*4+1][5] = -acos
+        qs3[i*4+2][5] = 2.*pi - acos
+        qs3[i*4+3][5] = -2.*pi + acos
+    qs4 = []
+    for i in range(len(qs3)):
+        _, Ts = forward_kin(qs3[i], a, d, l)
+        T14 = inv_mat(Ts[0]) * T * inv_mat(Ts[5]) * inv_mat(Ts[4])
+        qs_rrr = inverse_rrr(T14, a[1:4], d[1:4])
+        for j in range(len(qs_rrr)):
+            qsol = [qs3[i][0], qs_rrr[j][0], qs_rrr[j][1], qs_rrr[j][2], qs3[i][4], qs3[i][5]]
+            if abs(-sin(qsol[1] + qsol[2] + qsol[3])*sin(qsol[4]) - T[2,2]) < ZERO_THRESH:
+                qs4.append(qsol)
+            #Tsol, _ = forward_kin(qsol, a, d, l)
+            #print 'yo', qsol
+            #print Tsol**-1 * T06
+    if True:
+        qs4 = np.array(qs4)[np.lexsort(np.mat(qs4).T)[0]]
+        unique_sols = []
+        qlast = np.array([-999.]*6)
+        for i in range(np.size(qs4,0)):
+            if np.sum(abs(qlast - qs4[i])) > ZERO_THRESH:
+                unique_sols.append(qs4[i])
+                qlast = qs4[i]
+        return unique_sols
+
+def main():
+    if True:
+        #q = [ 4.07545758,  5.71643082, -4.57552159, -2.79061482, -3.17069678, 1.42865389]
+        d1, a2, a3, d4, d5, d6 = [0.1273, -0.612, -0.5723, 0.163941, 0.1157, 0.0922]
+        a = [0, a2, a3, 0, 0, 0]
+        d = [d1, 0, 0, d4, d5, d6]
+        l = [pi/2, 0, 0, pi/2, -pi/2, 0]
+        kin = RAVEKinematics()
+        rospy.init_node("test_ur_ik")
+        start_time = rospy.get_time()
+        n = 0
+        while not rospy.is_shutdown():
+            q = (np.random.rand(6)-.5)*4*pi
+            T = kin.forward(q)
+            sols = inverse_kin(T,a,d,l)
+            if False:
+                print len(sols)
+                for qsol in sols:
+                    #Tsol, _ = forward_kin(qsol, a, d, l)
+                    Tsol = kin.forward(qsol)
+                    diff = Tsol**-1 * T
+                    ang, _, _ = mat_to_ang_axis_point(diff)
+                    dist = np.linalg.norm(diff[:3,3])
+                    #print ang, dist
+                    if abs(dist) > 1e-8 or abs(ang) > 1e-8:
+                        print 'BAD'
+            n += 1
+        time_diff = rospy.get_time() - start_time
+        print time_diff, n, n/time_diff
+        
+    if False:
+        #q = [ 4.07545758,  5.71643082, -4.57552159, -2.79061482, -3.17069678, 1.42865389]
+        q = (np.random.rand(6)-.5)*4*pi
+        d1, a2, a3, d4, d5, d6 = [0.1273, -0.612, -0.5723, 0.163941, 0.1157, 0.0922]
+        a = [0, a2, a3, 0, 0, 0]
+        d = [d1, 0, 0, d4, d5, d6]
+        l = [pi/2, 0, 0, pi/2, -pi/2, 0]
+        kin = RAVEKinematics()
+        T = kin.forward(q)
+        print T
+        print forward_kin(q,a,d,l)
+        print q
+        sols = inverse_kin(T,a,d,l)
+        for qsol in sols:
+            Tsol, _ = forward_kin(qsol, a, d, l)
+            diff = Tsol**-1 * T
+            ang, _, _ = mat_to_ang_axis_point(diff)
+            dist = np.linalg.norm(diff[:3,3])
+            if False:
+                if abs(dist) > 1e-6:
+                    print '-'*80
+                else:
+                    print '+'*80
+                print 'T', T
+                print 'qsol', qsol
+                print 'q234', np.sum(qsol[1:4])
+                print 'q5', qsol[4]
+                print '-sin(q2 + q3 + q4)*sin(q5)', -sin(qsol[1] + qsol[2] + qsol[3])*sin(qsol[4])
+                print 'z3', T[2,0]
+                if abs(dist) > 1e-6:
+                    print '-'*80
+                else:
+                    print '+'*80
+            print ang, dist
+        print np.sort(sols,0)
+        print len(sols)
+        #unique_sols = np.array(sols)[np.where(np.hstack(([True], np.sum(np.diff(np.sort(sols,0), 1, 0),1) > 0.000)))[0]]
+        #print unique_sols
+        #print len(unique_sols)
+        #print len(np.hstack(([True], np.sum(np.diff(np.sort(sols,0), 1, 0),1) > 0.000)))
+        for qsol in sols:
+            #Tsol, _ = forward_kin(qsol, a, d, l)
+            Tsol = kin.forward(qsol)
+            diff = Tsol**-1 * T
+            ang, _, _ = mat_to_ang_axis_point(diff)
+            dist = np.linalg.norm(diff[:3,3])
+            print ang, dist
+            if abs(dist) > 1e-8:
+                print 'BAD'
+        
+        kin.robot.SetDOFValues(np.array([0.]*6))
+        rave_sols = kin.manip.FindIKSolutions(T.A, kin.ik_options)
+        rave_list = []
+        for qsol in rave_sols:
+            rave_list.append(np.array(qsol))
+            #Tsol, _ = forward_kin(qsol, a, d, l)
+            Tsol = kin.forward(qsol)
+            diff = Tsol**-1 * T
+            ang, _, _ = mat_to_ang_axis_point(diff)
+            dist = np.linalg.norm(diff[:3,3])
+            print ang, dist
+            if abs(dist) > 1e-8:
+                print 'BAD'
+        print np.sort(rave_list,0)
+            #print diff
+            #print q
+            #print qsol
+            #print '-'*80
+
+    if False:
+        q = (np.random.rand(3)-0.5)*4.*np.pi
+        T04 = forward_rrr(q)
+        print T04
+        qs = inverse_rrr(T04)
+        print qs
+        print T04**-1 * forward_rrr(qs[0])
+        print T04**-1 * forward_rrr(qs[1])
+
+if __name__ == "__main__":
+    import cProfile
+    cProfile.run('main()', 'prof')
+    #main()
